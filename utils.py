@@ -6,7 +6,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Dict
 
-OUTPUT_DIR = "output"
+OUTPUT_DIR = os.getenv("OUTPUT_DIR", "output")
 HISTORY_JSON = os.path.join(OUTPUT_DIR, "filtered_pairs_history.json")
 
 def ensure_dirs():

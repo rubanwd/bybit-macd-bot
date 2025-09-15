@@ -4,7 +4,7 @@ from typing import List, Dict
 from datetime import datetime
 import pytz
 
-OUTPUT_DIR = "output"
+OUTPUT_DIR = os.getenv("OUTPUT_DIR", "output")
 LAST_REPORT = os.path.join(OUTPUT_DIR, "last_report.txt")
 
 def ensure_output_dir():
