@@ -30,14 +30,17 @@ TF_TO_BYBIT = {
 
 LONG_TF_CODES = {"W", "M"}  # для этих берём меньшее limit
 
+
 def setup_logging():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
 
 def env_int(name: str, default: int) -> int:
     try:
         return int(os.getenv(name, default))
     except Exception:
         return default
+
 
 def parse_timeframes(env_val: str):
     if not env_val:
@@ -49,25 +52,27 @@ def parse_timeframes(env_val: str):
             valid.append(x)
         else:
             logging.warning(f"Игнорирую неизвестный таймфрейм в .env: {x}")
-    # без фанатизма: минимум один
     return valid or ["1D", "1W"]
+
 
 def check_sort_tf(sort_tf: str, timeframes):
     s = (sort_tf or "").strip().upper()
     if s in timeframes:
         return s
-    # если неверный — берём первый из списка
     logging.warning(f"SORT_TF={sort_tf} не найден в TIMEFRAMES. Использую {timeframes[0]}.")
     return timeframes[0]
+
 
 def kline_to_df(klines):
     return pd.DataFrame(klines)[["open", "high", "low", "close"]].astype(float)
 
-def compute_indicators(df: pd.DataFrame, macd_fast, macd_slow, macd_signal, rsi_period, atr_period, need_atr: bool):
+
+def compute_indicators(df: pd.DataFrame, macd_fast, macd_slow, macd_signal, rsi_period, atr_period):
     macd_line, signal_line, hist = macd(df["close"], macd_fast, macd_slow, macd_signal)
     rsi_series = rsi(df["close"], rsi_period)
-    atr_series = atr(df["high"], df["low"], df["close"], atr_period) if need_atr else None
+    atr_series = atr(df["high"], df["low"], df["close"], atr_period)
     return macd_line, signal_line, hist, rsi_series, atr_series
+
 
 def classify_trend(macd_line: pd.Series, signal_line: pd.Series, hist: pd.Series) -> str:
     bull = (macd_line.iloc[-1] > signal_line.iloc[-1]) and (hist.iloc[-1] > 0)
@@ -147,7 +152,7 @@ def main_loop():
                 for sym, t in tick_map.items():
                     try:
                         high = float(t.get("highPrice24h") or t.get("highPrice") or 0)
-                        low  = float(t.get("lowPrice24h")  or t.get("lowPrice")  or 0)
+                        low = float(t.get("lowPrice24h") or t.get("lowPrice") or 0)
                         last = float(t.get("lastPrice") or 0)
                         if last <= 0 or high <= 0 or low <= 0:
                             continue
@@ -167,8 +172,8 @@ def main_loop():
                 try:
                     trends = {}
                     rsis = {}
-                    atr_abs = None
-                    atr_pct = None
+                    atr_abs = {}
+                    atr_pct = {}
 
                     for tf in TIMEFRAMES:
                         interval = TF_TO_BYBIT[tf]
@@ -179,18 +184,18 @@ def main_loop():
                             return sym, None  # мало данных для одного из ТФ → пропуск пары
 
                         df = kline_to_df(kl)
-                        need_atr = (tf == SORT_TF)
                         m_line, s_line, h_line, rsi_series, atr_series = compute_indicators(
-                            df, MACD_FAST, MACD_SLOW, MACD_SIGNAL, RSI_PERIOD, ATR_PERIOD, need_atr
+                            df, MACD_FAST, MACD_SLOW, MACD_SIGNAL, RSI_PERIOD, ATR_PERIOD
                         )
                         trend = classify_trend(m_line, s_line, h_line)
                         trends[tf] = trend
                         rsis[tf] = float(rsi_series.iloc[-1])
 
-                        if need_atr:
-                            last_close = float(df["close"].iloc[-1])
-                            atr_abs = float(atr_series.iloc[-1]) if atr_series is not None else 0.0
-                            atr_pct = (atr_abs / last_close) if last_close else 0.0
+                        last_close = float(df["close"].iloc[-1])
+                        atr_abs_val = float(atr_series.iloc[-1])
+                        atr_pct_val = (atr_abs_val / last_close) if last_close else 0.0
+                        atr_abs[tf] = atr_abs_val
+                        atr_pct[tf] = atr_pct_val
 
                     # Все выбранные ТФ должны иметь одинаковый тренд (BULL или BEAR)
                     uniq = set(trends.values())
@@ -200,10 +205,12 @@ def main_loop():
 
                     payload = {
                         "common_trend": common,
-                        "atr_sort_abs": atr_abs,
-                        "atr_sort_pct": float(atr_pct or 0.0),
-                        # расплющим RSI в виде rsi_4H, rsi_1D, ...
-                        **{f"rsi_{tf}": rsis[tf] for tf in TIMEFRAMES},
+                        "atr_abs_map": atr_abs,
+                        "atr_pct_map": atr_pct,
+                        "rsi_map": rsis,
+                        # удобные ключи для прежней логики отбора TOP_N по SORT_TF:
+                        "atr_sort_abs": atr_abs.get(SORT_TF, 0.0),
+                        "atr_sort_pct": atr_pct.get(SORT_TF, 0.0),
                     }
                     return sym, payload
                 except Exception as e:
@@ -218,20 +225,25 @@ def main_loop():
                     if data:
                         results[sym] = data
 
-            # 4) Делим на BULL/BEAR, ограничиваем по TOP_N (сортировка по ATR% выбранного SORT_TF)
+            # 4) Делим на BULL/BEAR, ограничиваем по TOP_N (отбор по ATR% SORT_TF — как раньше)
             bull_list, bear_list = [], []
             for sym, d in results.items():
-                row = {
+                base = {
                     "symbol": f"{sym.replace('USDT', '')}/USDT",
-                    "atr_abs": d["atr_sort_abs"],
-                    "atr_pct": d["atr_sort_pct"],
-                    **{k: v for k, v in d.items() if k.startswith("rsi_")},
+                    "atr_abs": d["atr_sort_abs"],     # для внутренней сортировки/истории
+                    "atr_pct": d["atr_sort_pct"],     # для внутренней отсечки TOP_N
                 }
-                if d["common_trend"] == "BULL":
-                    bull_list.append(row)
-                elif d["common_trend"] == "BEAR":
-                    bear_list.append(row)
+                # добавим ATR% и RSI по каждому ТФ в явные ключи: atr_pct_{tf}, rsi_{tf}
+                for tf in TIMEFRAMES:
+                    base[f"rsi_{tf}"] = d["rsi_map"].get(tf, 0.0)
+                    base[f"atr_pct_{tf}"] = d["atr_pct_map"].get(tf, 0.0)
 
+                if d["common_trend"] == "BULL":
+                    bull_list.append(base)
+                elif d["common_trend"] == "BEAR":
+                    bear_list.append(base)
+
+            # ограничим по TOP_N по ATR% SORT_TF (как и было)
             bull_list = sorted(bull_list, key=lambda x: x["atr_pct"], reverse=True)[:TOP_N]
             bear_list = sorted(bear_list, key=lambda x: x["atr_pct"], reverse=True)[:TOP_N]
             logging.info(f"Финальный отбор ({'+'.join(TIMEFRAMES)}): BULL={len(bull_list)} BEAR={len(bear_list)}")
@@ -250,21 +262,27 @@ def main_loop():
                 bull_list = list(ex.map(add_oi, bull_list))
                 bear_list = list(ex.map(add_oi, bear_list))
 
-            # 6) Итоговая сортировка для отчёта — по абсолютному ATR выбранного SORT_TF (сильнее — выше)
-            bull_sorted = sorted(bull_list, key=lambda x: x["atr_abs"], reverse=True)
-            bear_sorted = sorted(bear_list, key=lambda x: x["atr_abs"], reverse=True)
+            # 6) Итоговая сортировка для вывода: по сумме RSI по всем выбранным ТФ (по убыванию)
+            def rsi_sum(item):
+                total = 0.0
+                for tf in TIMEFRAMES:
+                    total += float(item.get(f"rsi_{tf}", 0.0))
+                return total
+
+            bull_sorted = sorted(bull_list, key=rsi_sum, reverse=True)
+            bear_sorted = sorted(bear_list, key=rsi_sum, reverse=True)
 
             # 7) Формируем .txt и сохраняем
             report_text = build_report_txt(
                 bull_sorted,
                 bear_sorted,
                 timeframes=TIMEFRAMES,
-                sort_tf=SORT_TF,
+                sort_tf=SORT_TF,            # в шапке оставляем какой ТФ использован для TOP_N
                 tz="Europe/Kyiv",
             )
             filepath = write_report_file(report_text)
 
-            # 8) История (JSON) — кладём и набор ТФ
+            # 8) История (JSON)
             append_history({"bull": bull_sorted, "bear": bear_sorted, "timeframes": TIMEFRAMES, "sort_tf": SORT_TF})
 
             # 9) Telegram
